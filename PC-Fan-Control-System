@@ -1,0 +1,467 @@
+#include "TextLCD.h"
+#include "mbed.h"
+#include <LCD_ST7066U.h>
+#include <algorithm>
+#include <cmath>
+#include <stdio.h>
+
+#define DELAY_100us 100us
+#define DELAY_1 1ms
+#define DELAY_5 5ms
+#define DELAY_50 50ms
+#define DELAY_250 250ms
+#define DELAY_500 500ms
+#define DELAY_1000 1000ms
+#define DELAY_1500 1500ms
+#define DELAY_2000 2000ms
+
+#define encodersteps 20.0
+
+// Initialise the LCD with the arduino. LiquidCrystal(rs, enable, d4, d5, d6,
+// d7)
+TextLCD lcd(PA_6, PA_7, PB_4, PB_5, PB_3, PA_10);
+BufferedSerial mypc(USBTX, USBRX);
+InterruptIn rotA(PA_1);
+InterruptIn rotB(PA_4);
+DigitalOut ledBIr(PA_15);
+DigitalOut ledBIg(PB_7);
+InterruptIn button(BUTTON1);
+DigitalOut led_ob(LED1); //onboard LED
+DigitalOut led_D1(PC_0);
+// Variables for fan
+PwmOut fanSpeed(PB_0);
+InterruptIn fanTaco(PA_0);
+
+int D;
+int lastD;
+
+// Define the mode variable
+int mode = 0; // Mode = 1 for auto, Mode = 0 for manual
+int subMode = 0;
+int subModeFlag = 0;
+int RPMMode = 0;
+int RPMModeFlag = 0;
+const int modeSwitchThreshold = 1500000;
+const float minfanSetSpeed = 0.0605;
+// const int subModeSwitchThreshold = 1000000;
+const int maxRPM = 1700;
+int RPMtarget = 0;
+int RPMbiased = 0;
+
+// Define a timer and variables for tracking button press duration
+float buttonTimeNew;
+Timer buttonTimer;
+
+bool buttonPressed = false;
+bool toggleFlag = false;
+bool sensorGood = false;
+
+// Variables for encoder position
+int newState = 0;
+int state = 0;
+int counter = 10;
+int counterValue = maxRPM/2;
+int counterTemp = 21;
+
+unsigned int tacoTime1 = 0;
+// int tacoTimeSum1 = 0;
+Timer tacoTimer1;
+
+int flagTime70 = 0;
+int flagTime35 = 0;
+
+unsigned int tacoTime2 = 0;
+int tacoSave35 = 0;
+int tacoSave70 = 0;
+
+// int tacoTimeSum2 = 0;
+Timer tacoTimer2;
+
+int tacoTotalTime = 0;
+int RPM = 0;
+int zerocheckTime1 = 0;
+int zerocheckTime2 = 0;
+
+float fanSpeedSet = 0;
+float fanSetSpeed = 0;
+
+// PID controller constants
+const float Kp = 0.07;
+const float Ki = 0.002;
+const float Kd = 0;
+
+// PID variables for calculations
+float integral = 0.0;
+float derivative = 0.0;
+float errorPID = 0.0;
+float lastErrorPID = 0.0;
+
+// Define PID control parameters
+int RPMCounter = 1200;
+int RPMCounterPrev = 0;
+float setpoint = 1500.0; // Desired RPM
+float input = 0.0;       // Current RPM (initially set to 0)
+float outputPID = 0.0;
+int RPMaccumulator = 0;
+float alpha = 0.2;
+int RPMdiffaccumulator = 0;
+float alpha2 = 0.5;
+int errorRPM = 0;
+
+// Temp sensor variables
+I2C i2c(PB_9, PB_8);
+const int ts_addr = 0x9A; // define the I2C Address for TC74-A5
+// int error;
+int targetTemp = 23;
+int errorTemp;
+
+// unsigned char readBits = 0b11;     // 8 bits
+// unsigned char rotationBits = 0b01; // 8 bits
+
+void blink() {
+        led_ob = 1;
+        ThisThread::sleep_for(100ms);
+        led_ob = 0;
+}
+
+void Encoder() {
+  // counter = 0;
+  newState = (rotA.read() << 1) | rotB.read(); // Two bit state variable
+  // int diff = (newState - state); // Calculate the state change
+
+  wait_us(100);
+
+  if ((newState == 3 && state == 2)) {
+    switch (mode) {
+    case 0:
+      if (counter == 0) {counter = 3;} else {counter++;}
+      if (RPMCounter >= maxRPM) {RPMCounter = maxRPM;} else {RPMCounter = RPMCounter + 50;}
+      break;
+    case 1:
+      counterTemp++;
+      break;
+    }
+
+  } else if ((newState == 3 && state == 1)) {
+    if (counter == 3) {counter = 0;} else {counter--;}
+    if (RPMCounter <= 0) {RPMCounter = 0;} else {RPMCounter = RPMCounter - 50;}
+    RPMCounter = RPMCounter - 50;
+    
+  }
+
+  if (counter > encodersteps) {
+    counter = encodersteps;
+  } // clamp counter max and min
+  else if (counter < 0) {
+    counter = 0;
+  }
+
+  state = newState;
+}
+
+// Interrupt handler for button press
+void buttonPressedHandler() {
+  buttonPressed = true; // Not sure if this is necessary
+  buttonTimer.start();
+}
+
+// Interrupt handler for button release
+void buttonReleasedHandler() {
+  buttonTimeNew =buttonTimer.elapsed_time().count(); // buttonTimeNew = time since the button was pressed
+    if (buttonPressed && buttonTimeNew >= modeSwitchThreshold) {
+        // If the button was pressed for 1.5 seconds or more, toggle the mode
+        mode = !mode;
+        toggleFlag = 1;
+        subMode = 0;
+        RPMMode = 0;
+    }
+    else if (buttonPressed /*&& buttonTimeNew < modeSwitchThreshold && buttonTimeNew >= subModeSwitchThreshold*/) {
+        if (subMode <= 2) {
+        subMode++;
+        } else {
+        subMode = 0;
+        }
+        subModeFlag = 1;
+    }
+
+  buttonPressed = false; // Resets the button to "not pressed"
+  buttonTimer.stop();    // Stops the button timer
+  buttonTimer.reset();   // Resets the button timer
+}
+
+// Interrupt handler for the fan tachometer pulses
+void pulseRise() {
+
+  tacoTimer2.stop(); // Stops the button timer
+  tacoTime2 = 0;
+  tacoTime2 = tacoTimer2.elapsed_time().count(); // buttonTimeNew = time since the button was pressed in microseconds
+  tacoTimer2.reset(); // Resets the button timer
+  tacoTimer1.start();
+}
+
+void pulseFall() {
+    // led_D1 = 0;
+    tacoTimer1.stop(); // Stops the button timer
+    tacoTime1 = 0;
+    tacoTime1 = tacoTimer1.elapsed_time().count(); // buttonTimeNew = time since the button was pressed in microseconds
+    tacoTimer1.reset(); // Resets the button timer
+    tacoTimer2.start();
+    //flagZeroRPM = 0;
+
+  // ThisThread::sleep_for(DELAY_1);
+  // wait_us(100);
+}
+
+int calculateSpeed() {
+    if (tacoTimer1.elapsed_time().count() > 700000 || tacoTimer2.elapsed_time().count() > 700000) {
+        RPM = 0; 
+    } else if ((tacoTime1 >= 4000) && (tacoTime2 >= 7500)) {
+        tacoTotalTime = tacoTime1 + tacoTime2;
+        RPM = 60000000 / (tacoTotalTime * 2);
+    } else if (tacoTime2 >= 68000) {
+        flagTime70 = 1;
+        tacoSave70 = tacoTime2;
+    } else if (tacoTime1 >= 68000 && flagTime70 == 1) {
+        tacoTotalTime = tacoTime1 + tacoSave70;
+        RPM = 60000000 / (tacoTotalTime * 2 + 1000);
+    } else if (tacoTime2 >= 25000) {
+        flagTime35 = 1;
+        tacoSave35 = tacoTime2;
+    } else if (tacoTime1 >= 25000 && flagTime35 == 1) {
+        tacoTotalTime = tacoTime1 + tacoSave35;
+        RPM = 60000000 / (tacoTotalTime * 2 + 1000);
+    }
+    RPMdiffaccumulator = (alpha2 * ((RPM - RPMaccumulator) - RPMdiffaccumulator)) + RPMdiffaccumulator;
+    if (abs(RPMdiffaccumulator) >= 100) {alpha = 0.9;} else if (abs(RPMdiffaccumulator) >= 50) {alpha = 0.2;} else {alpha = 0.1;}
+    //if (abs(RPMdiffaccumulator) >= 100) {alpha = 0.9;} else {alpha = (0.00944 * RPMdiffaccumulator) - 0.0444s;}
+    RPMaccumulator = (alpha * (RPM - RPMaccumulator)) + RPMaccumulator;
+
+    return (RPMaccumulator);
+}
+
+float calculatePID(int RPMtarget, int currentRPM) {
+  errorPID = RPMtarget - currentRPM;
+  integral += errorPID;
+  derivative = errorPID - lastErrorPID;
+  lastErrorPID = errorPID;
+  // Calculate PID output
+  RPMbiased = Kp * errorPID + Ki * integral + Kd * derivative + RPMtarget;
+  return RPMbiased;
+}
+
+float RPMtoDC(int RPMtarget) {
+//Calculate ducty cycle from desired RPM
+    float setDC;
+    setDC = (1.221e-13) * RPMtarget * RPMtarget * RPMtarget * RPMtarget - (3.076e-10) * RPMtarget * RPMtarget *RPMtarget + (3.769e-07) * RPMtarget * RPMtarget + (1.585e-04)* RPMtarget; // linearize percentage to actual RPM
+    return(setDC);
+
+}
+
+int main() {
+  button.fall(&buttonPressedHandler);  // Attach the fall interrupt handler
+  button.rise(&buttonReleasedHandler); // Attach the rise interrupt handler
+
+  rotA.mode(PullUp);
+  rotB.mode(PullUp);
+  rotA.rise(&Encoder);
+  rotB.rise(&Encoder);
+  rotA.fall(&Encoder);
+  rotB.fall(&Encoder);
+
+  char tempdata[2];
+  int itempdata;
+
+  // Attach the interrupt handler to the rising edge of the fan tachometer
+  // pulses
+  fanTaco.rise(&pulseRise);
+  fanTaco.fall(&pulseFall);
+  fanSpeed.period(0.0035); // Set PWM period
+  fanSpeed.write(0.5);     // Initialize fan at 50% duty cycle
+
+  //
+
+  for (int address = 0; address < 256; address += 2) {
+    if (!i2c.write(address, NULL, 0)) { // 0 returned is ok
+        sensorGood = true;
+        blink();
+        ThisThread::sleep_for(200ms);
+        blink();
+        led_ob = 1;
+    }
+  }
+
+  while (1) {
+    // Adjust the fan speed by changing the duty cycle
+    i2c.write(ts_addr, 0x00,1); // Write to the address by modifying the last bit of the address and using a write command and write a "read temperature" command
+    i2c.read(ts_addr, tempdata,1); // Read the Data from the device by changing the last bit of the address to a read command
+
+    if (toggleFlag) {
+      lcd.cls();
+      switch (mode) {
+      case 0:
+        lcd.printf("Mode:\n Manual");
+        break;
+      case 1:
+        lcd.printf("Mode:\n Auto");
+        break;
+      }
+      ThisThread::sleep_for(DELAY_2000);
+      lcd.cls();
+      toggleFlag = 0;
+    }
+
+    RPM = calculateSpeed(); //read motor rpm
+    errorRPM = RPMCounter - RPM;
+    if (errorRPM >= 25) {ledBIr = 1; ledBIg = 0;} else {ledBIr = 0; ledBIg = 1;}
+
+    if (mode == 0) { // Manual control
+
+
+        if (subMode == 0) { // Fan % mode
+            if (subModeFlag) {
+            lcd.cls();
+            lcd.printf("Mode:\n Fan %%");
+            ThisThread::sleep_for(DELAY_1000);
+            lcd.cls();
+            subModeFlag = 0;
+            }
+
+            counterValue = counter * (100.0 / (int)encodersteps); // counter from 0-100 in encodersteps steps
+            RPMtarget = maxRPM * (counterValue / 100);
+            if (RPMtarget == maxRPM) {led_D1 = 1;} else {led_D1 = 0;}
+            RPMbiased = calculatePID(RPMtarget, RPM);            
+            fanSpeed.write(RPMtoDC(RPMbiased));
+
+            lcd.printf("T: %d%c\n", tempdata[0], (char)223);
+            // lcd.printf("T: %d%c\n",fanSetSpeed);
+            if (counterValue < 10) {
+            lcd.printf("Fan:  %d%%\n", (int)counterValue);
+            } else if (counterValue == 100) {
+            lcd.printf("Fan:%d%%\n", (int)counterValue);
+            } else {
+            lcd.printf("Fan: %d%%\n", (int)counterValue);
+            }
+
+        } else if (subMode == 1) { // RPM mode
+            if (subModeFlag) {
+            lcd.cls();
+            lcd.printf("Mode:\nSet RPM");
+            ThisThread::sleep_for(DELAY_1000);
+            lcd.cls();
+            subModeFlag = 0;
+            RPMCounter = (maxRPM / 100.0) * ((float)counterValue); // Gain of rpm
+            }
+
+            if (RPMCounter == maxRPM) {led_D1 = 1;} else {led_D1 = 0;}
+            RPMbiased = calculatePID(RPMCounter, RPM);            
+            fanSpeed.write(RPMtoDC(RPMbiased));
+
+            if (RPMCounter >= 1000) {
+                lcd.printf("T: %d%c\nRPM:%d\n", tempdata[0], (char)223, RPMCounter);
+            } else if (RPMCounter < 1000 && RPMCounter >= 100) {
+                lcd.printf("T: %d%c\nRPM: %d\n", tempdata[0], (char)223, RPMCounter);
+            } else if (RPMCounter < 100 && RPMCounter >= 10) {
+                lcd.printf("T: %d%c\nRPM:  %d\n", tempdata[0], (char)223, RPMCounter);
+            } else if (RPMCounter < 10) {
+                lcd.printf("T: %d%c\nRPM:   0\n", tempdata[0], (char)223);
+            }
+
+      } else if (subMode == 2) {
+            if (subModeFlag) {
+                lcd.cls();
+                lcd.printf("Mode:\nRead RPM");
+                ThisThread::sleep_for(DELAY_1000);
+                lcd.cls();
+                subModeFlag = 0;
+            }
+            if (RPMCounter == maxRPM) {led_D1 = 1;} else {led_D1 = 0;}
+            RPMbiased = calculatePID(RPMCounter, RPM);            
+            fanSpeed.write(RPMtoDC(RPMbiased));
+            
+            if (RPM >= 1000) {
+                lcd.printf("T: %d%c\nRPM:%d\n", tempdata[0], (char)223, RPM);
+                ThisThread::sleep_for(DELAY_500);
+            } else if (RPM < 1000 && RPM >= 100) {
+                lcd.printf("T: %d%c\nRPM: %d\n", tempdata[0], (char)223, RPM);
+                ThisThread::sleep_for(DELAY_500);
+            } else if (RPM < 100 && RPM >= 10) {
+                lcd.printf("T: %d%c\nRPM:  %d\n", tempdata[0], (char)223, RPM);
+                ThisThread::sleep_for(DELAY_500);
+            } else if (RPM < 10) {
+                lcd.printf("T: %d%c\nRPM:   0\n", tempdata[0], (char)223);
+            }
+
+      } else {
+        subMode = 0;
+      }
+
+    } else {              // Autocontrol
+
+        lcd.printf("Temp: %d\n%c >> %d%c\n", tempdata[0], (char)223, counterTemp, (char)223);
+        ThisThread::sleep_for(DELAY_50);
+        lcd.cls();
+        errorTemp = tempdata[0] - counterTemp;
+        if (errorTemp >= 1) {ledBIr = 1; ledBIg = 0;} else {ledBIr = 0; ledBIg = 1;}
+
+        if (subMode == 0) { // Normal mode
+            if (subModeFlag) {
+                lcd.cls();
+                lcd.printf("Mode:\nStandard");
+                ThisThread::sleep_for(DELAY_1000);
+                lcd.cls();
+                subModeFlag = 0;
+            }
+
+            if (errorTemp >= 1) {
+            fanSpeedSet = (errorTemp * 0.25);
+            fanSpeed.write(fanSpeedSet);
+            } else if (errorTemp == 0) {
+            fanSpeed.write(0.25);
+            } else {
+            fanSpeed.write(0);
+            }
+        }
+
+        else if (subMode == 1) { // Fast cool
+            if (subModeFlag) {
+                lcd.cls();
+                lcd.printf("Mode:  F\nast Cool");
+                ThisThread::sleep_for(DELAY_1000);
+                lcd.cls();
+                subModeFlag = 0;
+            }
+
+            if (errorTemp >= 1) {
+                fanSpeed.write(1);
+            } else if (errorTemp <= 0 && errorTemp >= -2) {
+                fanSpeed.write(0.5);
+            } else if (errorTemp < -2) {
+                fanSpeed.write(0);
+            }
+        }
+
+        else if (subMode == 2) { // Low Power Mode
+            if (subModeFlag) {
+                lcd.cls();
+                lcd.printf("Mode:  L\now Power");
+                ThisThread::sleep_for(DELAY_1000);
+                lcd.cls();
+                subModeFlag = 0;
+            }
+
+            if (errorTemp >= 3) {
+                fanSpeed.write(0.5);
+            } else if (errorTemp >= 1) {
+                fanSpeedSet = (errorTemp * 0.2);
+                fanSpeed.write(fanSpeedSet);
+            } /*else if (errorTemp < 1 && errorTemp > 0) {
+                fanSpeedSet = (errorTemp * 0.05);
+                fanSpeed.write(fanSpeedSet);
+            } */
+            else {
+                fanSpeed.write(0);
+            }
+        }
+    }
+  }
+}

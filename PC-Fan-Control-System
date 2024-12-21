@@ -13,9 +13,13 @@
 #define DELAY_500 500ms
 #define DELAY_1000 1000ms
 #define DELAY_1500 1500ms
-#define DELAY_2000 2000ms
+#define DELAY_2000 200ms
+
+
 
 #define encodersteps 20.0
+
+
 
 // Initialise the LCD with the arduino. LiquidCrystal(rs, enable, d4, d5, d6,
 // d7)
